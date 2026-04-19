@@ -23,7 +23,7 @@ from datetime import datetime, timezone, timedelta
 # ── Configuration ─────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get(
     "GEMINI_API_KEY",
-    "AIzaSyCltNnGXBe9eeHW9U8XGiA3vJ86GryOKkY"
+
 )
 JST = timezone(timedelta(hours=9))
 TODAY = sys.argv[1] if len(sys.argv) > 1 else datetime.now(JST).strftime("%Y-%m-%d")

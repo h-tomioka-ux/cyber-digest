@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 # ── Configuration ─────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get(
     "GEMINI_API_KEY",
-    "AIzaSyCltNnGXBe9eeHW9U8XGiA3vJ86GryOKkY"
+
 )
 GEMINI_MODELS = [
     "gemini-2.5-flash",

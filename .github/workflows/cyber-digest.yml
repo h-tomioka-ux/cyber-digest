@@ -1,0 +1,48 @@
+name: Cyber Digest
+
+on:
+  schedule:
+    - cron: '0 23 * * 0-4'  # 08:00 JST Mon-Fri
+  workflow_dispatch:          # manual run
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install google-genai
+
+      - name: Run Cyber Digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python scripts/run_digest.py > /tmp/digest_out.md 2>/tmp/digest_err.txt
+          EXIT=$?
+          cat /tmp/digest_err.txt
+          if [ $EXIT -eq 0 ] && head -1 /tmp/digest_out.md | grep -q '^---'; then
+            TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
+            cp /tmp/digest_out.md CyberDigest/${TODAY}.md
+            echo "Saved: CyberDigest/${TODAY}.md"
+          else
+            echo "Script failed or output invalid — skipping"
+            exit 1
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.email "cyber-digest-bot@github-actions"
+          git config user.name "cyber-digest-bot"
+          TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
+          git add CyberDigest/
+          git diff --cached --quiet || git commit -m "cyber-digest: ${TODAY}"
+          git push

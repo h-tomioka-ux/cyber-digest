@@ -1,0 +1,48 @@
+name: Cisco Digest
+
+on:
+  schedule:
+    - cron: '0 23 * * 0'  # 08:00 JST Monday
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install google-genai
+
+      - name: Run Cisco Digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python scripts/run_cisco_digest.py > /tmp/cisco_out.md 2>/tmp/cisco_err.txt
+          EXIT=$?
+          cat /tmp/cisco_err.txt
+          if [ $EXIT -eq 0 ] && head -1 /tmp/cisco_out.md | grep -q '^---'; then
+            TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
+            cp /tmp/cisco_out.md CiscoDigest/${TODAY}.md
+            echo "Saved: CiscoDigest/${TODAY}.md"
+          else
+            echo "Script failed or output invalid — skipping"
+            exit 1
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.email "cisco-digest-bot@github-actions"
+          git config user.name "cisco-digest-bot"
+          TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
+          git add CiscoDigest/
+          git diff --cached --quiet || git commit -m "cisco-digest: ${TODAY}"
+          git push

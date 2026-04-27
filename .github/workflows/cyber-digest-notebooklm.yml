@@ -1,0 +1,50 @@
+name: Cyber Digest (NotebookLM)
+
+on:
+  schedule:
+    - cron: '0 23 * * 0-4'  # 08:00 JST Mon-Fri
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install notebooklm-py
+          python -m playwright install chromium --with-deps
+
+      - name: Run Cyber Digest (NotebookLM)
+        env:
+          NOTEBOOKLM_SESSION: ${{ secrets.NOTEBOOKLM_SESSION }}
+        run: |
+          python scripts/run_notebooklm_digest.py > /tmp/digest_out.md 2>/tmp/digest_err.txt
+          EXIT=$?
+          cat /tmp/digest_err.txt >&2
+          if [ $EXIT -eq 0 ] && head -1 /tmp/digest_out.md | grep -q '^---'; then
+            TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
+            cp /tmp/digest_out.md CyberDigest/${TODAY}.md
+            echo "Saved: CyberDigest/${TODAY}.md"
+          else
+            echo "Script failed or output invalid — skipping"
+            exit 1
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.email "cyber-digest-bot@github-actions"
+          git config user.name "cyber-digest-bot"
+          TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
+          git add CyberDigest/
+          git diff --cached --quiet || git commit -m "cyber-digest(notebooklm): ${TODAY}"
+          git push

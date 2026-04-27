@@ -20,9 +20,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install notebooklm-py
-          python -m playwright install chromium --with-deps
+        run: pip install notebooklm-py
 
       - name: Run Cyber Digest (NotebookLM)
         env:

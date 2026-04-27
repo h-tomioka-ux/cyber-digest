@@ -26,9 +26,13 @@ jobs:
         env:
           NOTEBOOKLM_SESSION: ${{ secrets.NOTEBOOKLM_SESSION }}
         run: |
+          set +e
           python scripts/run_cisco_notebooklm_digest.py > /tmp/cisco_out.md 2>/tmp/cisco_err.txt
           EXIT=$?
+          set -e
+          echo "=== STDERR ===" >&2
           cat /tmp/cisco_err.txt >&2
+          echo "=== EXIT: $EXIT ===" >&2
           if [ $EXIT -eq 0 ] && head -1 /tmp/cisco_out.md | grep -q '^---'; then
             TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
             cp /tmp/cisco_out.md CiscoDigest/${TODAY}.md

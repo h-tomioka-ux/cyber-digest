@@ -137,7 +137,7 @@ async def run_notebooklm(article_urls: list[str]) -> str:
         print("  既存URLソースを確認・削除中...", file=sys.stderr)
         try:
             sources = await client.sources.list(NOTEBOOK_ID)
-            url_sources = [s for s in sources if s.kind == "url"]
+            url_sources = [s for s in sources if getattr(s, 'url', None)]
             for s in url_sources:
                 await client.sources.delete(NOTEBOOK_ID, s.id)
                 print(f"  削除: {s.title[:50]}", file=sys.stderr)

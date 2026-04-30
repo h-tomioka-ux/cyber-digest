@@ -1,0 +1,14 @@
+# Claude Code local settings (may contain API keys / tokens)
+# https://atmarkit.itmedia.co.jp/ait/articles/2604/28/news037.html
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Secrets / local config
+*.local
+.env
+.env.*

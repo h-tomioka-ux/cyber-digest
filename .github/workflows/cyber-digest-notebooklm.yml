@@ -1,8 +1,22 @@
 name: Cyber Digest (NotebookLM)
 
 on:
-  schedule:
-    - cron: '0 23 * * 0-4'  # 08:00 JST Mon-Fri
+  # Gemini 版 (cyber-digest.yml) の完了後に実行する。
+  #
+  # 両者は同じ CyberDigest/{日付}.md に書き込むため、同時刻 cron のままだと
+  # 「後に完了した方が勝つ」レースになり、日によって内容が変わってしまう。
+  #
+  # cron を30分ずらす案もあったが、GitHub Actions の cron は負荷状況で
+  # 数時間ずれることがあり（予定23:00 → 実行12:06 の実観測あり）、
+  # 時間差では順序を保証できない。workflow_run なら確実に「Gemini の後」になる。
+  #
+  # 結果として:
+  #   - まず Gemini 版が必ず生成される（土台。成功率100%）
+  #   - NotebookLM が成功した日だけ、引用付きの高品質版に差し替わる
+  #   - NotebookLM が失敗しても Gemini 版が残るので穴が空かない
+  workflow_run:
+    workflows: ["Cyber Digest"]
+    types: [completed]
   workflow_dispatch:
 
 jobs:

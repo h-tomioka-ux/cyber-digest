@@ -19,8 +19,28 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install notebooklm-py
+      - name: Install dependencies (with domain migration patch)
+        run: |
+          # cyber-digest-notebooklm.yml と同じ理由でドメイン置換が必要。
+          # Google が notebooklm.google.com -> notebook.google.com へ移行したが
+          # notebooklm-py が旧ドメインを決め打ちしており、Cookie 絞り込みからも
+          # 新ドメインの OSID / __Secure-OSID が漏れて認証が通らない。
+          set -e
+          pip install 'notebooklm-py==0.3.4'
+          PKG=$(python -c "import notebooklm, pathlib; print(pathlib.Path(notebooklm.__file__).parent)")
+          BEFORE=$(grep -rl 'notebooklm\.google\.com' "$PKG" --include=*.py | wc -l)
+          if [ "$BEFORE" -eq 0 ]; then
+            echo "ERROR: 置換対象が見つかりません。上流で構成が変わった可能性があります" >&2
+            exit 1
+          fi
+          grep -rl 'notebooklm\.google\.com' "$PKG" --include=*.py \
+            | xargs sed -i 's/notebooklm\.google\.com/notebook.google.com/g'
+          AFTER=$(grep -r 'notebooklm\.google\.com' "$PKG" --include=*.py | wc -l)
+          echo "patched files: $BEFORE / remaining refs: $AFTER"
+          if [ "$AFTER" -ne 0 ]; then
+            echo "ERROR: 置換しきれていません" >&2
+            exit 1
+          fi
 
       - name: Run Cisco Digest (NotebookLM)
         env:

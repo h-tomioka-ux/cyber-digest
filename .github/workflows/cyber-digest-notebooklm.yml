@@ -19,8 +19,32 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install notebooklm-py
+      - name: Install dependencies (with domain migration patch)
+        run: |
+          # Google が NotebookLM を notebooklm.google.com から notebook.google.com へ
+          # 移行したが、notebooklm-py は旧ドメインを決め打ちしている（0.8.0 でも未対応）。
+          # さらに auth.py の Cookie 絞り込みも旧ドメインしか許可しないため、
+          # 新ドメインにホストスコープで発行される OSID / __Secure-OSID が捨てられ、
+          # 「Authentication expired or invalid」で必ず失敗する。
+          # 下の置換で「APIのURL」と「Cookie許可ドメイン」の両方が同時に直る。
+          # 0.3.4 は動作検証済み。0.8.0 は未対応かつAPI変更があるためバージョン固定する。
+          set -e
+          pip install 'notebooklm-py==0.3.4'
+          PKG=$(python -c "import notebooklm, pathlib; print(pathlib.Path(notebooklm.__file__).parent)")
+          echo "package dir: $PKG"
+          BEFORE=$(grep -rl 'notebooklm\.google\.com' "$PKG" --include=*.py | wc -l)
+          if [ "$BEFORE" -eq 0 ]; then
+            echo "ERROR: 置換対象が見つかりません。上流で構成が変わった可能性があります" >&2
+            exit 1
+          fi
+          grep -rl 'notebooklm\.google\.com' "$PKG" --include=*.py \
+            | xargs sed -i 's/notebooklm\.google\.com/notebook.google.com/g'
+          AFTER=$(grep -r 'notebooklm\.google\.com' "$PKG" --include=*.py | wc -l)
+          echo "patched files: $BEFORE / remaining refs: $AFTER"
+          if [ "$AFTER" -ne 0 ]; then
+            echo "ERROR: 置換しきれていません" >&2
+            exit 1
+          fi
 
       - name: Run Cyber Digest (NotebookLM)
         env:

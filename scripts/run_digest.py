@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cyber Digest - RSS Collection + Gemini Analysis
-Collects security news from RSS feeds and analyzes with Gemini API (plain HTTP).
+Cyber Digest - RSS Collection + Article Body Extraction + Gemini Analysis
+
+Collects security news from RSS feeds, fetches each article's body text,
+and analyzes with Gemini API (plain HTTP, stdlib only).
+
+2026-08-10 変更:
+    従来はタイトルとURLだけを Gemini に渡していたため、AI が中身を推測して
+    書く（ハルシネーション）余地があった。各記事の本文を取得して渡すことで
+    「ソースに基づく要約」に変更した。本文が取れない記事は RSS の description に
+    フォールバックし、それも無ければタイトルのみと明示する。
 
 Usage:
     python run_digest.py [YYYY-MM-DD]
@@ -16,8 +24,10 @@ import re
 import os
 import json
 import time
+import html
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -40,6 +50,17 @@ RSS_FEEDS = [
 
 MAX_ITEMS_PER_FEED = 8
 
+# ── Article body fetching ─────────────────────────────────────────────────────
+MAX_BODY_CHARS   = 1500   # 1記事あたりの本文上限 (トークン量の制御)
+TOTAL_BODY_CHARS = 90000  # 全記事合計の上限。超えたら以降は要約のみ
+FETCH_WORKERS    = 6      # 並列取得数 (実行時間を抑える)
+FETCH_TIMEOUT    = 12     # 1記事あたりのタイムアウト秒
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
 # Models to try in order (fallback chain)
 GEMINI_MODELS = [
     "gemini-2.0-flash",
@@ -49,6 +70,7 @@ GEMINI_MODELS = [
 ]
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
 
 # ── RSS Collection ─────────────────────────────────────────────────────────────
 def fetch_rss(url: str, timeout: int = 15) -> str:
@@ -64,18 +86,19 @@ def fetch_rss(url: str, timeout: int = 15) -> str:
 
 
 def unescape_html(text: str) -> str:
-    return (text
-            .replace("&amp;",  "&")
-            .replace("&lt;",   "<")
-            .replace("&gt;",   ">")
-            .replace("&#39;",  "'")
-            .replace("&quot;", '"')
-            .replace("&nbsp;", " "))
+    return html.unescape(text)
+
+
+def strip_tags(fragment: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    return re.sub(r"\s+", " ", unescape_html(text)).strip()
 
 
 def parse_rss(xml: str, source: str) -> list[dict]:
+    """RSS/RDF から title / url / description(要約) を取り出す。"""
     items = []
-    for block in re.findall(r"<item[\s\S]*?</item>", xml, re.IGNORECASE)[:MAX_ITEMS_PER_FEED]:
+    blocks = re.findall(r"<item[\s\S]*?</item>", xml, re.IGNORECASE)[:MAX_ITEMS_PER_FEED]
+    for block in blocks:
         t = re.search(r"<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</title>",   block, re.IGNORECASE)
         l = (re.search(r"<link[^>]*>(?:<!\[CDATA\[)?(https?://[^\s<\]]+)(?:\]\]>)?</link>", block, re.IGNORECASE) or
              re.search(r"<guid[^>]*>(https?://[^\s<]+)</guid>",                               block, re.IGNORECASE))
@@ -83,8 +106,21 @@ def parse_rss(xml: str, source: str) -> list[dict]:
             continue
         title = re.sub(r"<[^>]+>", "", unescape_html(t.group(1))).strip()
         url   = l.group(1).strip()
+
+        # RSS 側の要約 (本文取得に失敗したときのフォールバック)
+        d = (re.search(r"<content:encoded[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</content:encoded>", block, re.IGNORECASE) or
+             re.search(r"<description[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</description>",         block, re.IGNORECASE))
+        rss_summary = strip_tags(d.group(1))[:MAX_BODY_CHARS] if d else ""
+
         if title and len(title) > 5 and not re.fullmatch(r"(RSS|Feed|Home|\s*)", title, re.IGNORECASE):
-            items.append({"title": title, "url": url, "source": source})
+            items.append({
+                "title": title,
+                "url": url,
+                "source": source,
+                "rss_summary": rss_summary,
+                "body": "",
+                "body_origin": "none",
+            })
     return items
 
 
@@ -99,6 +135,100 @@ def collect_news() -> list[dict]:
     return all_items
 
 
+# ── Article body extraction (stdlib only) ─────────────────────────────────────
+def html_to_text(raw_html: str) -> str:
+    """HTML から本文らしいテキストを抽出する。外部ライブラリ不使用。"""
+    # 1. ノイズタグを中身ごと除去
+    noise = r"script|style|noscript|svg|form|nav|header|footer|aside|iframe|figure|button"
+    cleaned = re.sub(rf"<({noise})[\s\S]*?</\1>", " ", raw_html, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<!--[\s\S]*?-->", " ", cleaned)
+
+    # 2. 本文コンテナ候補をすべて集め、最も長いものを採用する
+    #    （最初の <article> が「関連記事」等の小さい要素であるケースを避ける）
+    #    属性はシングル/ダブル両方のクォートに対応（例: TheHackerNews は id='articlebody'）
+    BODY_CLASS = r"(?:article-?body|entry-content|post-content|content-body|post-body|story-body)"
+    candidates = []
+    for pattern in (
+        r"<article[^>]*>([\s\S]*?)</article>",
+        r"<main[^>]*>([\s\S]*?)</main>",
+        rf"<div[^>]*(?:class|id)=[\"'][^\"']*{BODY_CLASS}[^\"']*[\"'][^>]*>([\s\S]*?)</div>",
+    ):
+        for m in re.finditer(pattern, cleaned, re.IGNORECASE):
+            frag = m.group(1)
+            if len(frag) > 400:
+                candidates.append(frag)
+
+    scope = max(candidates, key=len) if candidates else cleaned
+
+    # 3. <p> を優先して拾う。少なければ全体をテキスト化
+    paras = re.findall(r"<p[^>]*>([\s\S]*?)</p>", scope, re.IGNORECASE)
+    texts = [strip_tags(p) for p in paras]
+    texts = [t for t in texts if len(t) > 40]
+
+    if len(" ".join(texts)) < 200:
+        body = strip_tags(scope)
+    else:
+        body = "\n".join(texts)
+
+    return re.sub(r"\s+\n", "\n", body).strip()
+
+
+def fetch_article_body(item: dict) -> dict:
+    """1記事の本文を取得。失敗しても例外を投げず item を返す。"""
+    url = item["url"]
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ja,en;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "html" not in ctype and "xml" not in ctype:
+                raise ValueError(f"non-html content-type: {ctype[:40]}")
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read(600_000).decode(charset, errors="replace")
+
+        body = html_to_text(raw)
+        if len(body) >= 200:
+            item["body"] = body[:MAX_BODY_CHARS]
+            item["body_origin"] = "fulltext"
+            return item
+        raise ValueError(f"body too short ({len(body)} chars)")
+
+    except Exception as e:
+        # フォールバック: RSS の description
+        if item.get("rss_summary"):
+            item["body"] = item["rss_summary"]
+            item["body_origin"] = "rss"
+        else:
+            item["body"] = ""
+            item["body_origin"] = "none"
+        print(f"  [body] 失敗 → {item['body_origin']}: {url} ({e})", file=sys.stderr)
+        return item
+
+
+def enrich_with_bodies(items: list[dict]) -> list[dict]:
+    """全記事の本文を並列取得し、合計文字数の上限も守る。"""
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        items = list(ex.map(fetch_article_body, items))
+
+    # 合計上限を超えたら、超過分は本文を落として要約扱いにする
+    total = 0
+    for it in items:
+        if total + len(it["body"]) > TOTAL_BODY_CHARS:
+            it["body"] = it["body"][:300]
+            if it["body_origin"] == "fulltext":
+                it["body_origin"] = "truncated"
+        total += len(it["body"])
+
+    stats = {}
+    for it in items:
+        stats[it["body_origin"]] = stats.get(it["body_origin"], 0) + 1
+    print(f"  本文取得結果: {stats}（合計 {total:,} 文字）", file=sys.stderr)
+    return items
+
+
 # ── Gemini Analysis (plain HTTP, no SDK) ───────────────────────────────────────
 def _call_gemini_http(model_name: str, prompt: str) -> str:
     url = f"{GEMINI_BASE}/{model_name}:generateContent?key={GEMINI_API_KEY}"
@@ -108,7 +238,7 @@ def _call_gemini_http(model_name: str, prompt: str) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=180) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -147,16 +277,45 @@ def _gemini_with_retry(prompt: str) -> str:
     raise RuntimeError(f"全モデルでGemini API呼び出しに失敗しました: {last_err}")
 
 
-def analyze_with_gemini(items: list[dict]) -> str:
-    titles_text = "\n".join(
-        f"- [{item['source']}] {item['title']} - {item['url']}"
-        for item in items
-    )
-    prompt = f"""あなたはサイバーセキュリティの専門家アナリストです。
-以下の今日（{TODAY}）のセキュリティニュースタイトル一覧を分析し、6つのカテゴリ別に日本語で要約してください。
+ORIGIN_LABEL = {
+    "fulltext":  "本文",
+    "rss":       "RSS要約のみ",
+    "truncated": "本文(冒頭のみ)",
+    "none":      "本文取得不可・タイトルのみ",
+}
 
-【収集したニュースタイトル一覧】
-{titles_text}
+
+def build_articles_block(items: list[dict]) -> str:
+    chunks = []
+    for i, item in enumerate(items, 1):
+        label = ORIGIN_LABEL.get(item["body_origin"], item["body_origin"])
+        body  = item["body"].strip() or "(本文なし)"
+        chunks.append(
+            f"### 記事{i}\n"
+            f"- ソース: {item['source']}\n"
+            f"- タイトル: {item['title']}\n"
+            f"- URL: {item['url']}\n"
+            f"- 本文種別: {label}\n"
+            f"- 本文:\n{body}\n"
+        )
+    return "\n".join(chunks)
+
+
+def analyze_with_gemini(items: list[dict]) -> str:
+    articles_text = build_articles_block(items)
+    prompt = f"""あなたはサイバーセキュリティの専門家アナリストです。
+以下は今日（{TODAY}）収集したセキュリティニュース記事の本文です。
+**必ず提供された本文の記述のみを根拠に**、6つのカテゴリ別に日本語で要約してください。
+
+## 最重要ルール（厳守）
+- **本文に書かれていない事実を創作しない**。推測を書く場合は「〜と見られる」等と明示する
+- CVE番号・CVSSスコア・被害規模・製品名は、**本文に明記されている場合のみ**記載する
+- 本文種別が「RSS要約のみ」「本文取得不可・タイトルのみ」の記事は、
+  情報が限定的である前提で慎重に扱い、断定を避ける
+- 本文に根拠がない項目は「不明」と書く（数値をでっち上げない）
+
+【収集した記事】
+{articles_text}
 
 ## 出力ルール
 - 各カテゴリのセクション見出しは必ず出力する（該当なしでも）
@@ -227,16 +386,25 @@ def analyze_with_gemini_fallback() -> str:
 def build_markdown(items: list[dict], analysis: str) -> str:
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
     if items:
-        sources = sorted({item["source"] for item in items})
-        meta = f"収集件数: {len(items)}件 ／ ソース: {', '.join(sources)} ＋ Gemini分析"
+        sources   = sorted({item["source"] for item in items})
+        full      = sum(1 for i in items if i["body_origin"] in ("fulltext", "truncated"))
+        rss_only  = sum(1 for i in items if i["body_origin"] == "rss")
+        title_only = sum(1 for i in items if i["body_origin"] == "none")
+        meta = (
+            f"収集件数: {len(items)}件"
+            f"（本文取得 {full} / RSS要約 {rss_only} / タイトルのみ {title_only}）"
+            f" ／ ソース: {', '.join(sources)} ＋ Gemini分析"
+        )
+        src_field = "rss+fulltext+gemini"
     else:
         meta = "RSS収集不可 ／ Gemini知識ベースによる生成"
+        src_field = "gemini-knowledge"
     return f"""---
 tags:
   - cyber-digest
   - security
 date: {TODAY}
-source: rss+gemini
+source: {src_field}
 ---
 
 # 🛡️ サイバーセキュリティ・ダイジェスト {TODAY}
@@ -261,18 +429,21 @@ def main():
     rss_failed = not items
     if rss_failed:
         print("  WARNING: RSS取得失敗。Gemini知識ベースでダイジェストを生成します。", file=sys.stderr)
+    else:
+        print(f"\n📰 Step 2: 各記事の本文を取得中（並列{FETCH_WORKERS})...", file=sys.stderr)
+        items = enrich_with_bodies(items)
 
-    print("\n🤖 Step 2: Gemini APIで分析中...", file=sys.stderr)
+    print("\n🤖 Step 3: Gemini APIで分析中...", file=sys.stderr)
     if rss_failed:
         analysis = analyze_with_gemini_fallback()
     else:
         analysis = analyze_with_gemini(items)
     print("  分析完了", file=sys.stderr)
 
-    print("\n📝 Step 3: Markdown生成中...", file=sys.stderr)
+    print("\n📝 Step 4: Markdown生成中...", file=sys.stderr)
     markdown = build_markdown(items, analysis)
 
-    # Output to stdout — Claude will capture and save to vault
+    # Output to stdout
     sys.stdout.buffer.write(markdown.encode("utf-8"))
     print("\n✅ 完了", file=sys.stderr)
 

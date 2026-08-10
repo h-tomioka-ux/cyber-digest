@@ -62,11 +62,15 @@ BROWSER_UA = (
 )
 
 # Models to try in order (fallback chain)
+# 2026-08-10: gemini-2.0-flash / 2.0-flash-lite は無料枠が実質使えず、
+# 毎回 429 → 15秒待機 → 再試行 → 次モデル、で約40秒を空費していた
+# （本文取得の追加前から発生。実測で 2.5-flash が初回成功）。
+# 実際に通るモデルを先頭に並べ替えた。2.0 系は最後の保険として残す。
 GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"

@@ -25,9 +25,15 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          # bash -e のままだと python が失敗した瞬間にステップが終了し、
+          # 後続の cat でログを出せずデバッグ不能になる。明示的に囲う。
+          set +e
           python scripts/run_digest.py > /tmp/digest_out.md 2>/tmp/digest_err.txt
           EXIT=$?
+          set -e
+          echo "=== STDERR ==="
           cat /tmp/digest_err.txt
+          echo "=== EXIT: $EXIT ==="
           if [ $EXIT -eq 0 ] && head -1 /tmp/digest_out.md | grep -q '^---'; then
             TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
             cp /tmp/digest_out.md CyberDigest/${TODAY}.md
@@ -41,7 +47,16 @@ jobs:
         run: |
           git config user.email "cyber-digest-bot@github-actions"
           git config user.name "cyber-digest-bot"
+          git config pull.rebase true
           TODAY=$(python -c "from datetime import datetime, timezone, timedelta; print(datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d'))")
           git add CyberDigest/
-          git diff --cached --quiet || git commit -m "cyber-digest: ${TODAY}"
-          git push
+          git diff --cached --quiet && { echo "No changes"; exit 0; }
+          git commit -m "cyber-digest: ${TODAY}"
+          # 複数ワークフローが同じ main を押すため、rejected を想定してリトライする
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main || true
+            if git push; then echo "Push OK on attempt $i"; exit 0; fi
+            echo "Push attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+          echo "Push failed after 5 attempts"; exit 1

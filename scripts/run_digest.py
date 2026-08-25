@@ -305,6 +305,55 @@ def build_articles_block(items: list[dict]) -> str:
     return "\n".join(chunks)
 
 
+_URL_RE = re.compile(r'https?://[^\s\)\]<>"]+')
+
+
+def _url_key(u: str) -> str:
+    """比較用の正規化キー。大文字小文字と末尾スラッシュの差を吸収する。"""
+    return u.lower().rstrip("/")
+
+
+def repair_urls(analysis: str, items: list[dict]) -> str:
+    """AI が出力した URL を、実際に収集した URL に強制的に揃える。
+
+    本文を渡しても LLM は URL の綴りを「整形」してしまう。
+    実測 (2026-08-25, Cisco 28記事): 出力51URL中 12件 (24%) が改変されていた。
+      例) .../achieves-fedramp-class-d-...  →  .../achieves-fedRAMP-class-d-...
+    URL のパスは大文字小文字を区別するため、これはそのままリンク切れになる。
+    プロンプトで禁じるだけでは防げないので、機械的に実 URL へ付け替える。
+    """
+    real = {_url_key(it["url"]): it["url"] for it in items}
+    repaired, unknown = [], []
+
+    def _sub(m):
+        raw = m.group(0)
+        trail = ""
+        while raw and raw[-1] in ".,;:":      # 文末句読点は URL に含めない
+            trail, raw = raw[-1] + trail, raw[:-1]
+        fixed = real.get(_url_key(raw))
+        if fixed is None:
+            unknown.append(raw)
+            return raw + trail
+        if fixed != raw:
+            repaired.append((raw, fixed))
+        return fixed + trail
+
+    result = _URL_RE.sub(_sub, analysis)
+
+    if repaired:
+        print(f"  [url] {len(repaired)} 件の URL を実物へ修復:", file=sys.stderr)
+        for before, after in repaired[:5]:
+            print(f"    - {before}\n      → {after}", file=sys.stderr)
+    if unknown:
+        print(f"  [url] WARNING: 収集記事に無い URL {len(unknown)} 件（AI の創作の疑い）:",
+              file=sys.stderr)
+        for u in unknown[:5]:
+            print(f"    - {u}", file=sys.stderr)
+    if not repaired and not unknown:
+        print("  [url] 全URLが実物と一致", file=sys.stderr)
+    return result
+
+
 def analyze_with_gemini(items: list[dict]) -> str:
     articles_text = build_articles_block(items)
     prompt = f"""あなたはサイバーセキュリティの専門家アナリストです。
@@ -323,7 +372,10 @@ def analyze_with_gemini(items: list[dict]) -> str:
 
 ## 出力ルール
 - 各カテゴリのセクション見出しは必ず出力する（該当なしでも）
-- 該当ありの場合: 「### [タイトル](URL)\\n- **概要**: 1〜2文」
+- 該当ありの場合、見出しは**必ず Markdown リンク形式**で書く: `### [タイトル](URL)`
+  - `### タイトル (URL)` のように URL を丸括弧で並べる書き方は禁止
+  - 見出しの次の行に「- **概要**: 1〜2文」を書く
+- **URLは提供されたものを1文字も変えずにコピーする**（大文字小文字も変えない）
 - 脆弱性情報には「- **CVSS**: スコアまたは不明」「- **対応**: パッチ有無・推奨アクション」も追記
 - 業界動向は箇条書き「- [タイトル](URL) — 一言まとめ」
 - 該当なしの場合: 「- 該当なし」
@@ -443,6 +495,10 @@ def main():
     else:
         analysis = analyze_with_gemini(items)
     print("  分析完了", file=sys.stderr)
+
+    if not rss_failed:
+        # AI が書き換えた URL を実物へ戻す (フォールバック時は照合先が無いので行わない)
+        analysis = repair_urls(analysis, items)
 
     print("\n📝 Step 4: Markdown生成中...", file=sys.stderr)
     markdown = build_markdown(items, analysis)

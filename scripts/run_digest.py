@@ -65,12 +65,24 @@ BROWSER_UA = (
 # 2026-08-10: gemini-2.0-flash / 2.0-flash-lite は無料枠が実質使えず、
 # 毎回 429 → 15秒待機 → 再試行 → 次モデル、で約40秒を空費していた
 # （本文取得の追加前から発生。実測で 2.5-flash が初回成功）。
-# 実際に通るモデルを先頭に並べ替えた。2.0 系は最後の保険として残す。
+# 実際に通るモデルを先頭に並べ替えた。
+#
+# 2026-09-15: gemini-2.0-flash / 2.0-flash-lite が Google 側で**廃止**され、
+# 404 "no longer available" を返すようになっていた（ListModels からも消滅）。
+# この結果フォールバックは実質2段しかなく、2.5 系が両方とも 503/timeout した
+# 09-10 と 09-14 に全滅してダイジェストが欠落した。
+#   → 生存を実測（ListModels + generateContent 200）したモデルだけに差し替える。
+#   → 同じ事故を繰り返さないため、**世代を跨がせる**ことと、Google 側の世代交代に
+#      自動追従する **`-latest` エイリアス**を混ぜることを意図した並びにしている。
+#      ハードコードしたモデル名は、いつか必ず廃止されるため。
+# 注: Gemini 3.x も応答は単一 text パート（thought パートが先頭に来ない）ことを
+#     実測で確認済み。`parts[0]["text"]` の取り出しはそのままで壊れない。
 GEMINI_MODELS = [
-    "gemini-2.5-flash",
+    "gemini-2.5-flash",         # 実績あり（このプロンプトで長期運用・品質検証済み）
+    "gemini-3.5-flash",         # 別世代の保険。2.5 系が同時に混雑しても生き残る
+    "gemini-flash-latest",      # エイリアス: 世代交代に自動追従
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
+    "gemini-flash-lite-latest", # エイリアス: 最後の保険
 ]
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"

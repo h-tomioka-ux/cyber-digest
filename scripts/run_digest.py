@@ -259,13 +259,46 @@ def _call_gemini_http(model_name: str, prompt: str) -> str:
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
+# 「待てば通る」一時エラー。同じモデルで backoff リトライする。
+# 503 = high demand / 500 502 504 = ゲートウェイ系 / 429 = レート制限。
+TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
+GEMINI_ATTEMPTS_PER_MODEL = 3
+GEMINI_BACKOFF_SECONDS = [5, 15]     # attempt1 失敗後 / attempt2 失敗後
+
+
+def _backoff_or_give_up(attempt: int, model_name: str, reason: str) -> bool:
+    """一時エラー時に待つ。このモデルをまだ試すなら True、諦めるなら False。"""
+    if attempt + 1 >= GEMINI_ATTEMPTS_PER_MODEL:
+        print(f"  {model_name} {reason}が解消せず。次のモデルを試みます...", file=sys.stderr)
+        return False
+    wait = GEMINI_BACKOFF_SECONDS[min(attempt, len(GEMINI_BACKOFF_SECONDS) - 1)]
+    print(f"  {model_name} {reason}。{wait}秒後にリトライします...", file=sys.stderr)
+    time.sleep(wait)
+    return True
+
+
 def _gemini_with_retry(prompt: str) -> str:
+    """モデルを順に試す。一時エラーは同一モデルで粘り、恒久エラーは即座に次へ。
+
+    2026-09-15: 以前は `for attempt in range(2)` というループを持ちながら、
+    実際にリトライしていたのは 429 だけで、**503 と read timeout は1回で break** して
+    次のモデルへ流していた。この2つはまさに「数秒待てば通る」種類のエラーで、
+    09-10 と 09-14 はこれが原因で全モデルを数十秒で消化し尽くして失敗している。
+      → 一時エラー（TRANSIENT_HTTP_CODES / タイムアウト等のネットワーク例外）と
+        恒久エラー（404 モデル廃止・400 不正リクエスト）を明確に分け、
+        前者だけ backoff して粘る。後者で粘っても無駄に時間を捨てるだけなので即座に次へ。
+    """
     last_err = None
     for model_name in GEMINI_MODELS:
-        for attempt in range(2):
+        for attempt in range(GEMINI_ATTEMPTS_PER_MODEL):
             try:
-                print(f"  モデル: {model_name} (attempt {attempt+1})...", file=sys.stderr)
+                print(
+                    f"  モデル: {model_name} "
+                    f"(attempt {attempt+1}/{GEMINI_ATTEMPTS_PER_MODEL})...",
+                    file=sys.stderr,
+                )
                 return _call_gemini_http(model_name, prompt)
+
             except urllib.error.HTTPError as e:
                 last_err = e
                 body_text = ""
@@ -273,23 +306,39 @@ def _gemini_with_retry(prompt: str) -> str:
                     body_text = e.read().decode("utf-8", errors="replace")
                 except Exception:
                     pass
-                if e.code == 429 or "quota" in body_text.lower() or "exhausted" in body_text.lower():
-                    if attempt == 0:
-                        print(f"  レート制限。15秒後にリトライ...", file=sys.stderr)
-                        time.sleep(15)
-                    else:
-                        print(f"  {model_name} クォータ超過。次のモデルを試みます...", file=sys.stderr)
-                        break
-                elif e.code == 403 and "leaked" in body_text.lower():
+                low = body_text.lower()
+
+                # APIキー自体が死んでいる。どのモデルでも直らないが、
+                # 切り分けのため従来どおり次のモデルへは進む。
+                if e.code == 403 and "leaked" in low:
                     print(f"  {model_name} APIキーが無効。次のモデルを試みます...", file=sys.stderr)
                     break
-                else:
-                    print(f"  {model_name} エラー {e.code}: {body_text[:100]}", file=sys.stderr)
+
+                is_quota = e.code == 429 or "quota" in low or "exhausted" in low
+                if is_quota or e.code in TRANSIENT_HTTP_CODES:
+                    reason = "クォータ/レート制限" if is_quota else f"一時エラー {e.code}"
+                    print(f"  {model_name} エラー {e.code}: {body_text[:150]}", file=sys.stderr)
+                    if _backoff_or_give_up(attempt, model_name, reason):
+                        continue
                     break
+
+                # 404(モデル廃止) / 400(不正リクエスト) など。待っても直らない。
+                print(
+                    f"  {model_name} エラー {e.code}（恒久エラー・リトライしません）: "
+                    f"{body_text[:150]}",
+                    file=sys.stderr,
+                )
+                break
+
             except Exception as e:
+                # socket.timeout / URLError / 不完全な読み取り など。
+                # 503 と同様に一時的なことが多いのでリトライ対象にする。
                 last_err = e
                 print(f"  {model_name} 例外: {e}", file=sys.stderr)
+                if _backoff_or_give_up(attempt, model_name, "通信エラー"):
+                    continue
                 break
+
     raise RuntimeError(f"全モデルでGemini API呼び出しに失敗しました: {last_err}")
 
 
